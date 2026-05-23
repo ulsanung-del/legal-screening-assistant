@@ -21,9 +21,11 @@ class Settings(BaseSettings):
     job_ttl_minutes: int = 30
     uploads_per_minute: int = 10
     max_concurrent_screenings: int = 2
+    local_demo_mode: bool = False
 
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.0-flash"
+    gemini_timeout_seconds: int = 45
     
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"

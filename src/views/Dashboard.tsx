@@ -1,6 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { isAbortRequestError, isTimeoutRequestError, type ScreeningResult } from '../api/client';
+import {
+  isAbortRequestError,
+  isTimeoutRequestError,
+  LOCAL_DEMO_MODE,
+  type JobLifecycleStatus,
+  type ScreeningResult,
+} from '../api/client';
 import { MaskingCompare } from '../components/MaskingCompare';
 import { clearScreeningQueries, useJobStatus, useScreeningResult, useStartScreening } from '../hooks/useScreening';
 import {
@@ -99,12 +105,109 @@ const ALLOWED_UPLOAD_MIME_TYPES: Record<string, Set<string>> = {
   docx: new Set(['application/vnd.openxmlformats-officedocument.wordprocessingml.document']),
 };
 
-const JOB_NODE_LABELS: Record<string, string> = {
-  screening: '스크리닝 작업 준비 중',
-  langgraph: 'LangGraph 법률 분석 실행 중',
-  completed: '분석 완료',
-  failed: '분석 실패',
+const ANALYSIS_STEPS = [
+  { phase: 1, label: '계약서 구조 분석 및 민감 정보 마스킹' },
+  { phase: 2, label: '유사 판례 및 위험 조항 검토' },
+  { phase: 3, label: '책임 범위 및 독소 조항 분류' },
+  { phase: 4, label: '수정 권고안 및 대체 조항 생성' },
+] as const;
+
+type AnalysisPhase = 1 | 2 | 3 | 4 | 5;
+
+const NODE_PHASE_MAP: Record<string, AnalysisPhase> = {
+  screening: 1,
+  parser: 1,
+  masker: 1,
+  init: 1,
+  law_context: 2,
+  langgraph: 2,
+  rag_retriever: 2,
+  screener: 3,
+  guardrail: 3,
+  generator: 4,
+  demasker: 4,
+  completed: 5,
 };
+
+const DEMO_READY_KEY = 'deepgle_demo_ready';
+
+function resolveAnalysisPhase(
+  currentNode: string | null | undefined,
+  jobStatus: JobLifecycleStatus | undefined,
+  elapsedMs: number,
+): AnalysisPhase {
+  if (jobStatus === 'completed') return 5;
+  if (currentNode && NODE_PHASE_MAP[currentNode]) return NODE_PHASE_MAP[currentNode];
+  if (LOCAL_DEMO_MODE) {
+    if (elapsedMs < 800) return 1;
+    if (elapsedMs < 1800) return 2;
+    if (elapsedMs < 4000) return 3;
+    return 4;
+  }
+  if (elapsedMs < 2500) return 1;
+  if (elapsedMs < 6000) return 2;
+  if (elapsedMs < 12000) return 3;
+  return 4;
+}
+
+function getStatusHeadline(phase: AnalysisPhase, isWarmup: boolean): string {
+  if (isWarmup && phase === 1) return '초기 분석 환경을 준비하고 있습니다...';
+  switch (phase) {
+    case 1:
+      return '계약서 구조를 분석하고 있습니다...';
+    case 2:
+      return '위험 가능성이 높은 조항을 식별하고 있습니다...';
+    case 3:
+      return '책임 범위와 독소 조항을 분류하고 있습니다...';
+    case 4:
+      return '수정 권고안을 생성하고 있습니다...';
+    default:
+      return '최종 분석 결과를 정리하고 있습니다...';
+  }
+}
+
+function getAuxiliaryMessage(elapsedMs: number): string | null {
+  if (LOCAL_DEMO_MODE) {
+    if (elapsedMs >= 12000) return '완료 상태를 확인하는 중입니다.';
+    return null;
+  }
+  if (elapsedMs >= 20000) return '거의 완료되었습니다. 결과를 정리하고 있습니다.';
+  if (elapsedMs >= 10000) return '계약 조항 수가 많아 분석에 시간이 더 소요되고 있습니다.';
+  return null;
+}
+
+function getProgressTarget(
+  phase: AnalysisPhase,
+  elapsedMs: number,
+  backendProgress: number,
+): number {
+  const ceilings = [15, 45, 75, 95, 98] as const;
+  const floor = phase === 1 ? 0 : ceilings[phase - 2];
+  const ceiling = ceilings[phase - 1];
+  const phaseWindowMs = LOCAL_DEMO_MODE ? 2000 : 8000;
+  const phaseElapsed = elapsedMs % phaseWindowMs;
+  const creepRatio = LOCAL_DEMO_MODE ? 0.8 : 0.35;
+  const creep = (phaseElapsed / phaseWindowMs) * (ceiling - floor) * creepRatio;
+  const timeBased = floor + creep;
+  const backendBased = backendProgress > 0 ? backendProgress : timeBased;
+  return Math.min(ceiling, Math.max(timeBased, backendBased * (LOCAL_DEMO_MODE ? 0.99 : 0.95)));
+}
+
+function hasCompletedDemoBefore(): boolean {
+  try {
+    return Boolean(sessionStorage.getItem(DEMO_READY_KEY));
+  } catch {
+    return true;
+  }
+}
+
+function markDemoReady(): void {
+  try {
+    sessionStorage.setItem(DEMO_READY_KEY, '1');
+  } catch {
+    // sessionStorage unavailable
+  }
+}
 
 function getFileExtension(filename: string): string {
   return filename.split('.').pop()?.toLowerCase() || '';
@@ -163,8 +266,10 @@ export const Dashboard: React.FC = () => {
   const [searchTerm, setSearchTerm] = useState('');
   const [isUploading, setIsUploading] = useState(false);
   const [uploadSuccess, setUploadSuccess] = useState(false);
-  const [uploadStep, setUploadStep] = useState<number>(0);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [animatedProgress, setAnimatedProgress] = useState(0);
+  const [elapsedMs, setElapsedMs] = useState(0);
+  const [isWarmupSession] = useState(() => !hasCompletedDemoBefore());
   const [jobId, setJobId] = useState<string | null>(null);
   const [uploadMeta, setUploadMeta] = useState<UploadMeta | null>(null);
   const [apiContract, setApiContract] = useState<ContractData | null>(null);
@@ -175,16 +280,39 @@ export const Dashboard: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const finishUploadTimerRef = useRef<number | null>(null);
   const shineBlockTimerRef = useRef<number | null>(null);
+  const processingStartedAtRef = useRef<number | null>(null);
+  const progressRafRef = useRef<number | null>(null);
   const flowVersionRef = useRef(0);
   const isUnmountedRef = useRef(false);
   const [diffViewMode, setDiffViewMode] = useState<'side-by-side' | 'redline'>('redline');
   const [shineBlockId, setShineBlockId] = useState<string | null>(null);
   const [blocks, setBlocks] = useState<ContractBlock[]>([]);
   const currentJobIdRef = useRef<string | null>(null);
-  const pollingProgress = jobStatusQuery.data?.progress ?? 0;
-  const progressPercent = isUploading ? Math.max((uploadStep - 1) * 25, pollingProgress) : 0;
+  const jobLifecycleStatus = jobStatusQuery.data?.status;
   const currentNode = jobStatusQuery.data?.current_node;
-  const currentNodeLabel = currentNode ? JOB_NODE_LABELS[currentNode] ?? currentNode : null;
+  const pollingProgress = jobStatusQuery.data?.progress ?? 0;
+
+  const analysisPhase = useMemo(() => {
+    if (!isUploading) return 1 as AnalysisPhase;
+    return resolveAnalysisPhase(currentNode, jobLifecycleStatus, elapsedMs);
+  }, [currentNode, elapsedMs, isUploading, jobLifecycleStatus]);
+
+  const displayStep = Math.min(4, analysisPhase);
+  const progressPercent = isUploading
+    ? Math.max(3, Math.min(100, animatedProgress))
+    : 0;
+
+  const statusHeadline = getStatusHeadline(analysisPhase, isWarmupSession);
+  const auxiliaryMessage = isUploading ? getAuxiliaryMessage(elapsedMs) : null;
+
+  const previewStep = useMemo(() => {
+    if (!isUploading || analysisPhase >= 4) return null;
+    const phaseStartEstimate = [0, 2500, 6000, 12000][analysisPhase - 1] ?? 0;
+    if (elapsedMs - phaseStartEstimate > 5000) {
+      return Math.min(4, analysisPhase + 1);
+    }
+    return null;
+  }, [analysisPhase, elapsedMs, isUploading]);
 
   const clearPendingTimers = () => {
     if (finishUploadTimerRef.current !== null) {
@@ -194,6 +322,10 @@ export const Dashboard: React.FC = () => {
     if (shineBlockTimerRef.current !== null) {
       window.clearTimeout(shineBlockTimerRef.current);
       shineBlockTimerRef.current = null;
+    }
+    if (progressRafRef.current !== null) {
+      cancelAnimationFrame(progressRafRef.current);
+      progressRafRef.current = null;
     }
   };
 
@@ -206,15 +338,18 @@ export const Dashboard: React.FC = () => {
   const finishUploadUi = () => {
     if (!canApplyUploadState()) return;
     clearPendingTimers();
-    setUploadStep(5);
+    markDemoReady();
+    setAnimatedProgress(100);
     setIsUploading(false);
     setUploadSuccess(true);
+    processingStartedAtRef.current = null;
     finishUploadTimerRef.current = window.setTimeout(() => {
       if (!canApplyUploadState()) return;
       setUploadSuccess(false);
-      setUploadStep(0);
+      setAnimatedProgress(0);
+      setElapsedMs(0);
       finishUploadTimerRef.current = null;
-    }, 3000);
+    }, LOCAL_DEMO_MODE ? 800 : 3000);
   };
 
   useEffect(() => {
@@ -228,20 +363,68 @@ export const Dashboard: React.FC = () => {
   }, [queryClient, startScreeningMutation.cancelStartRequest]);
 
   useEffect(() => {
+    if (!isUploading) {
+      setElapsedMs(0);
+      processingStartedAtRef.current = null;
+      return;
+    }
+    if (processingStartedAtRef.current === null) {
+      processingStartedAtRef.current = Date.now();
+    }
+    const tick = () => {
+      if (processingStartedAtRef.current !== null) {
+        setElapsedMs(Date.now() - processingStartedAtRef.current);
+      }
+    };
+    tick();
+    const intervalId = window.setInterval(tick, 500);
+    return () => window.clearInterval(intervalId);
+  }, [isUploading]);
+
+  useEffect(() => {
+    if (!isUploading) {
+      setAnimatedProgress(0);
+      if (progressRafRef.current !== null) {
+        cancelAnimationFrame(progressRafRef.current);
+        progressRafRef.current = null;
+      }
+      return;
+    }
+
+    const animate = () => {
+      const target = getProgressTarget(analysisPhase, elapsedMs, pollingProgress);
+      setAnimatedProgress((prev) => {
+        const delta = target - prev;
+        if (Math.abs(delta) < 0.15) return target;
+        return prev + delta * (LOCAL_DEMO_MODE ? 0.45 : 0.12);
+      });
+      progressRafRef.current = requestAnimationFrame(animate);
+    };
+
+    progressRafRef.current = requestAnimationFrame(animate);
+    return () => {
+      if (progressRafRef.current !== null) {
+        cancelAnimationFrame(progressRafRef.current);
+        progressRafRef.current = null;
+      }
+    };
+  }, [analysisPhase, elapsedMs, isUploading, pollingProgress]);
+
+  useEffect(() => {
+    if (!isUploading) return;
+  }, [displayStep, isUploading]);
+
+  useEffect(() => {
     const status = jobStatusQuery.data;
     if (!isUploading || !jobId || !status || status.job_id !== jobId) return;
     if (!canApplyUploadState()) return;
 
     if (status.status === 'failed') {
       setIsUploading(false);
-      setUploadStep(0);
+      setAnimatedProgress(0);
+      setElapsedMs(0);
+      processingStartedAtRef.current = null;
       setUploadError(status.error || '계약서 분석 작업이 실패했습니다.');
-      return;
-    }
-
-    if (status.status === 'processing') {
-      const nextStep = Math.min(4, Math.max(2, Math.ceil(status.progress / 25)));
-      setUploadStep(nextStep);
     }
   }, [isUploading, jobId, jobStatusQuery.data]);
 
@@ -252,7 +435,9 @@ export const Dashboard: React.FC = () => {
       return;
     }
     setIsUploading(false);
-    setUploadStep(0);
+    setAnimatedProgress(0);
+    setElapsedMs(0);
+    processingStartedAtRef.current = null;
     setUploadError(
       jobStatusQuery.error instanceof Error
         ? jobStatusQuery.error.message
@@ -270,7 +455,9 @@ export const Dashboard: React.FC = () => {
       return;
     }
     setIsUploading(false);
-    setUploadStep(0);
+    setAnimatedProgress(0);
+    setElapsedMs(0);
+    processingStartedAtRef.current = null;
     setUploadError(
       screeningResultQuery.error instanceof Error
         ? screeningResultQuery.error.message
@@ -284,7 +471,7 @@ export const Dashboard: React.FC = () => {
     if (apiScreening?.job_id === screening.job_id) return;
     if (!canApplyUploadState()) return;
 
-    setUploadStep(4);
+    setAnimatedProgress(98);
     setApiScreening(screening);
     const mapped = mapResultToContractData(screening, uploadMeta);
     setApiContract(mapped);
@@ -301,11 +488,19 @@ export const Dashboard: React.FC = () => {
     flowVersionRef.current = flowVersion;
     clearPendingTimers();
     setUploadError(null);
+    setIsUploading(true);
+    setUploadSuccess(false);
+    setAnimatedProgress(3);
+    setElapsedMs(0);
+    processingStartedAtRef.current = Date.now();
     try {
       await validateUploadFile(file);
     } catch (err) {
       if (isUnmountedRef.current || flowVersionRef.current !== flowVersion) return;
-      setUploadStep(0);
+      setIsUploading(false);
+      setAnimatedProgress(0);
+      setElapsedMs(0);
+      processingStartedAtRef.current = null;
       setUploadSuccess(false);
       setUploadError(
         err instanceof Error ? err.message : '업로드할 수 없는 파일입니다.',
@@ -313,15 +508,12 @@ export const Dashboard: React.FC = () => {
       return;
     }
 
-    setIsUploading(true);
-    setUploadStep(1);
-    setUploadSuccess(false);
     await clearScreeningQueries(queryClient, currentJobIdRef.current);
     if (isUnmountedRef.current || flowVersionRef.current !== flowVersion) return;
     setJobId(null);
     setUploadMeta(null);
     try {
-      setUploadStep(2);
+      setAnimatedProgress(8);
       const data = await startScreeningMutation.mutateAsync(file);
       if (isUnmountedRef.current || flowVersionRef.current !== flowVersion) return;
       setJobId(data.upload.job_id);
@@ -330,7 +522,9 @@ export const Dashboard: React.FC = () => {
       if (isUnmountedRef.current || flowVersionRef.current !== flowVersion) return;
       if (isAbortRequestError(err)) return;
       setIsUploading(false);
-      setUploadStep(0);
+      setAnimatedProgress(0);
+      setElapsedMs(0);
+      processingStartedAtRef.current = null;
       const message = isTimeoutRequestError(err)
         ? '업로드 요청 시간이 초과되었습니다. 네트워크 상태를 확인한 뒤 다시 시도해 주세요.'
         : err instanceof Error
@@ -376,7 +570,9 @@ export const Dashboard: React.FC = () => {
     setBlocks([]);
     setSelectedRiskId('');
     setSearchTerm('');
-    setUploadStep(0);
+    setAnimatedProgress(0);
+    setElapsedMs(0);
+    processingStartedAtRef.current = null;
     setUploadSuccess(false);
     setUploadError(null);
     startScreeningMutation.reset();
@@ -571,65 +767,75 @@ export const Dashboard: React.FC = () => {
                 />
                 {isUploading ? (
                   <div className="flex flex-col items-start w-full gap-4 py-2 px-1 select-none animate-slide-in">
-                    <div className="flex items-center gap-2 w-full justify-center">
-                      <RefreshCw className="w-4 h-4 text-navy-800 animate-spin shrink-0" />
-                      <span className="text-xs font-bold text-slate-700">민감 정보 마스킹 및 계약서 분석 중...</span>
+                    <div className="flex flex-col items-center gap-1.5 w-full justify-center min-h-[2.5rem]">
+                      <div className="flex items-center gap-2">
+                        <RefreshCw className="w-4 h-4 text-navy-800 animate-spin shrink-0" />
+                        <span
+                          key={statusHeadline}
+                          className="text-xs font-semibold text-slate-700 animate-fade-in-up"
+                        >
+                          {statusHeadline}
+                        </span>
+                      </div>
+                      {auxiliaryMessage && (
+                        <p
+                          key={auxiliaryMessage}
+                          className="text-[11px] text-slate-500 font-medium text-center animate-fade-in-up"
+                        >
+                          {auxiliaryMessage}
+                        </p>
+                      )}
                     </div>
-                    {/* Shimmering Timeline Steps */}
                     <div className="space-y-3.5 w-full max-w-md mx-auto text-left py-2">
-                      <div className="flex items-center gap-2.5">
-                        <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold shrink-0 ${
-                          uploadStep > 1 ? 'bg-emerald-500 text-white' : 'bg-navy-800 text-white animate-pulse'
-                        }`}>
-                          {uploadStep > 1 ? <Check className="w-3 h-3" /> : '1'}
-                        </span>
-                        <span className={`text-xs font-medium leading-5 transition-colors duration-300 ${uploadStep === 1 ? 'text-navy-800' : uploadStep > 1 ? 'text-slate-400' : 'text-slate-300'}`}>
-                          계약서 구조 파악 및 민감 정보 마스킹
-                        </span>
-                      </div>
-                      
-                      <div className="flex items-center gap-2.5">
-                        <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold shrink-0 ${
-                          uploadStep > 2 ? 'bg-emerald-500 text-white' : uploadStep === 2 ? 'bg-navy-800 text-white animate-pulse' : 'bg-slate-200 text-slate-500'
-                        }`}>
-                          {uploadStep > 2 ? <Check className="w-3 h-3" /> : '2'}
-                        </span>
-                        <span className={`text-xs font-medium leading-5 transition-colors duration-300 ${uploadStep === 2 ? 'text-navy-800' : uploadStep > 2 ? 'text-slate-400' : 'text-slate-300'}`}>
-                          법률 위반 및 표준 조항 대비 검색
-                        </span>
-                      </div>
-                      
-                      <div className="flex items-center gap-2.5">
-                        <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold shrink-0 ${
-                          uploadStep > 3 ? 'bg-emerald-500 text-white' : uploadStep === 3 ? 'bg-navy-800 text-white animate-pulse' : 'bg-slate-200 text-slate-500'
-                        }`}>
-                          {uploadStep > 3 ? <Check className="w-3 h-3" /> : '3'}
-                        </span>
-                        <span className={`text-xs font-medium leading-5 transition-colors duration-300 ${uploadStep === 3 ? 'text-navy-800' : uploadStep > 3 ? 'text-slate-400' : 'text-slate-300'}`}>
-                          책임 한도액 및 면책 위험도 분류
-                        </span>
-                      </div>
-                      
-                      <div className="flex items-center gap-2.5">
-                        <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold shrink-0 ${
-                          uploadStep > 4 ? 'bg-emerald-500 text-white' : uploadStep === 4 ? 'bg-navy-800 text-white animate-pulse' : 'bg-slate-200 text-slate-500'
-                        }`}>
-                          {uploadStep > 4 ? <Check className="w-3 h-3" /> : '4'}
-                        </span>
-                        <span className={`text-xs font-medium leading-5 transition-colors duration-300 ${uploadStep === 4 ? 'text-navy-800' : 'text-slate-300'}`}>
-                          수정 권고안 생성 및 검토
-                        </span>
-                      </div>
+                      {ANALYSIS_STEPS.map((step) => {
+                        const isComplete = displayStep > step.phase;
+                        const isActive = displayStep === step.phase;
+                        const isPreview = previewStep === step.phase;
+                        return (
+                          <div
+                            key={step.phase}
+                            className={`flex items-center gap-2.5 transition-opacity duration-500 ${
+                              isPreview && !isActive && !isComplete ? 'opacity-70' : 'opacity-100'
+                            }`}
+                          >
+                            <span
+                              className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold shrink-0 transition-colors duration-300 ${
+                                isComplete
+                                  ? 'bg-emerald-500 text-white'
+                                  : isActive
+                                    ? 'bg-navy-800 text-white'
+                                    : isPreview
+                                      ? 'bg-navy-200 text-navy-700'
+                                      : 'bg-slate-200 text-slate-500'
+                              } ${isActive ? 'ring-2 ring-navy-800/15' : ''}`}
+                            >
+                              {isComplete ? <Check className="w-3 h-3" /> : step.phase}
+                            </span>
+                            <span
+                              className={`text-xs font-medium leading-5 transition-colors duration-300 ${
+                                isActive
+                                  ? 'text-navy-800'
+                                  : isComplete
+                                    ? 'text-slate-400'
+                                    : isPreview
+                                      ? 'text-slate-500'
+                                      : 'text-slate-300'
+                              }`}
+                            >
+                              {step.label}
+                            </span>
+                          </div>
+                        );
+                      })}
                     </div>
-                    {/* Shimmer line bar */}
-                    <div className="w-full bg-slate-200 h-2 rounded-full overflow-hidden mt-1 max-w-md mx-auto">
-                      <div className="bg-navy-800 h-full transition-all duration-300" style={{ width: `${progressPercent}%` }}></div>
+                    <div className="w-full bg-slate-200 h-2 rounded-full overflow-hidden mt-1 max-w-md mx-auto relative">
+                      <div
+                        className={`bg-navy-800 h-full rounded-full progress-bar-fill transition-[width] ease-out ${
+                          LOCAL_DEMO_MODE ? 'duration-75' : 'duration-200'
+                        }`}
+                        style={{ width: `${progressPercent}%` }}
+                      />
                     </div>
-                    {currentNodeLabel && (
-                      <div className="w-full max-w-md mx-auto text-[11px] text-slate-500 font-semibold text-center">
-                        현재 단계: {currentNodeLabel}
-                      </div>
-                    )}
                   </div>
                 ) : uploadSuccess ? (
                   <div className="flex flex-col items-center gap-3 py-6 animate-scale-in">

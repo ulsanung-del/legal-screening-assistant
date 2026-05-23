@@ -7,6 +7,7 @@ import {
   uploadContract,
   isAbortRequestError,
   isTimeoutRequestError,
+  LOCAL_DEMO_MODE,
   type JobStatus,
   type ScreeningResult,
   type UploadResponse,
@@ -93,6 +94,13 @@ export function useStartScreening() {
       if (activeRequestIdRef.current !== data.requestId) return;
       queryClient.setQueryData<JobStatus>(screeningKeys.status(data.upload.job_id), data.status);
       queryClient.removeQueries({ queryKey: screeningKeys.result(data.upload.job_id) });
+      if (LOCAL_DEMO_MODE && data.status.status === 'completed') {
+        void queryClient.fetchQuery({
+          queryKey: screeningKeys.result(data.upload.job_id),
+          queryFn: ({ signal }) => getResult(data.upload.job_id, { signal }),
+          staleTime: Infinity,
+        });
+      }
     },
     onError: (error) => {
       if (isAbortRequestError(error)) return;
@@ -113,7 +121,8 @@ export function useJobStatus(jobId: string | null) {
     enabled: Boolean(jobId),
     refetchInterval: (query) => {
       const status = query.state.data?.status;
-      return status === 'completed' || status === 'failed' ? false : 1250;
+      if (status === 'completed' || status === 'failed') return false;
+      return LOCAL_DEMO_MODE ? 250 : 1250;
     },
     refetchIntervalInBackground: false,
     retry: (failureCount, error) => {
@@ -121,7 +130,7 @@ export function useJobStatus(jobId: string | null) {
       if (isTimeoutRequestError(error)) return failureCount < 2;
       return failureCount < 2;
     },
-    retryDelay: 500,
+    retryDelay: LOCAL_DEMO_MODE ? 100 : 500,
   });
 }
 
@@ -136,6 +145,6 @@ export function useScreeningResult(jobId: string | null, status?: JobStatus['sta
       if (isTimeoutRequestError(error)) return failureCount < 2;
       return failureCount < 1;
     },
-    retryDelay: 700,
+    retryDelay: LOCAL_DEMO_MODE ? 100 : 700,
   });
 }

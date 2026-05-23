@@ -89,6 +89,7 @@ async def _run_screening_background(job_id: str, raw_text: str) -> None:
 @router.post("/screen", response_model=JobStatusResponse, status_code=202)
 async def screen_contract(body: ScreenRequest, background_tasks: BackgroundTasks) -> JobStatusResponse:
     _cleanup_jobs()
+    settings = get_settings()
     store = get_job_store()
     try:
         record = store.require(body.job_id)
@@ -100,7 +101,7 @@ async def screen_contract(body: ScreenRequest, background_tasks: BackgroundTasks
     if record.status == "processing":
         return store.to_status_dto(body.job_id)
 
-    if not get_rate_limiter().try_acquire_screening(get_settings().max_concurrent_screenings):
+    if not get_rate_limiter().try_acquire_screening(settings.max_concurrent_screenings):
         raise HTTPException(
             status_code=429,
             detail=ErrorResponse(
@@ -111,7 +112,10 @@ async def screen_contract(body: ScreenRequest, background_tasks: BackgroundTasks
 
     try:
         store.set_processing(body.job_id)
-        background_tasks.add_task(_run_screening_background, body.job_id, record.raw_text)
+        if settings.local_demo_mode:
+            await _run_screening_background(body.job_id, record.raw_text)
+        else:
+            background_tasks.add_task(_run_screening_background, body.job_id, record.raw_text)
     except Exception:
         get_rate_limiter().release_screening()
         raise

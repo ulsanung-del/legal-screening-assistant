@@ -7,6 +7,7 @@ const POLLING_TIMEOUT_MS = 8_000;
 const RESULT_TIMEOUT_MS = 20_000;
 const DEMO_API_TOKEN = import.meta.env.VITE_DEMO_API_TOKEN as string | undefined;
 const DEMO_TOKEN_HEADER = 'X-Demo-Token';
+export const LOCAL_DEMO_MODE = import.meta.env.VITE_LOCAL_DEMO_MODE === 'true';
 
 export interface RequestOptions {
   signal?: AbortSignal;
@@ -196,7 +197,7 @@ export async function runScreen(jobId: string, options?: RequestOptions): Promis
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ job_id: jobId }),
     },
-    { timeoutMs: SCREEN_START_TIMEOUT_MS, ...options },
+    { timeoutMs: LOCAL_DEMO_MODE ? RESULT_TIMEOUT_MS : SCREEN_START_TIMEOUT_MS, ...options },
   );
   if (!res.ok) throw new Error(await parseError(res));
   return res.json();

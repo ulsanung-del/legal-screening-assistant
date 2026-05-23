@@ -68,8 +68,8 @@ def search_related_laws(query: str, limit: int = 3) -> list[dict[str, Any]]:
 
     settings = get_settings()
     oc = settings.law_api_key.strip()
-    if not oc:
-        logger.info("[LawAPI] LAW_API_KEY 없음 → local_db fallback")
+    if settings.local_demo_mode or not oc:
+        logger.info("[LawAPI] local_db fallback")
         return _local_search(query, limit)
 
     params = {
@@ -125,7 +125,7 @@ def get_law_summary(law_id: str) -> dict[str, Any]:
 
     settings = get_settings()
     oc = settings.law_api_key.strip()
-    if not oc:
+    if settings.local_demo_mode or not oc:
         return {
             "law_id": law_id,
             "title": "법령 요약",

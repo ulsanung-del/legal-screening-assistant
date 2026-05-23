@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
@@ -27,6 +28,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def preload_local_demo_pipeline() -> None:
+    if not settings.local_demo_mode:
+        return
+    loop = asyncio.get_running_loop()
+    try:
+        from backend.services.pipeline_service import get_screening_pipeline
+
+        await loop.run_in_executor(None, get_screening_pipeline)
+        logger.info("[LocalDemo] screening pipeline preloaded")
+    except Exception:
+        logger.warning("[LocalDemo] pipeline preload failed; first request will retry", exc_info=True)
 
 PROTECTED_API_PREFIXES = (
     "/api/upload",
